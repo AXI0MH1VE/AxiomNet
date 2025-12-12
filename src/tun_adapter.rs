@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::io::{self, ErrorKind};
 use std::net::Ipv4Addr;
 use tun::{Configuration, Device as TunDevice, Layer};
 

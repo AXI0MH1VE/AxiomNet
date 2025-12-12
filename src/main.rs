@@ -24,11 +24,10 @@ use session::Session;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::signal;
 use topology::Coordinates;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, EnvFilter, prelude::*};
 
 #[derive(Parser, Debug)]
 #[command(name = "axiomd")]
@@ -155,7 +154,6 @@ impl AxiomNode {
             PacketType::Keepalive => {
                 tracing::trace!("Keepalive from {}", from);
             }
-            _ => {}
         }
 
         Ok(())
@@ -228,7 +226,7 @@ impl AxiomNode {
     /// Broadcast heartbeat to all connected peers
     async fn broadcast_heartbeat(&self) -> Result<()> {
         let msg = control::ControlMessage::Heartbeat {
-            peer_id: u32::from_ne_bytes(self.overlay_ip.segments()[6].to_ne_bytes()),
+            peer_id: self.overlay_ip.segments()[6] as u32,
             my_coords: self.self_coords,
             my_load: 0, // TODO: Calculate actual node load
         };
@@ -295,7 +293,7 @@ impl AxiomNode {
             loop {
                 interval.tick().await;
                 let msg = control::ControlMessage::Heartbeat {
-                    peer_id: u32::from_ne_bytes(overlay_ip.segments()[6].to_ne_bytes()),
+                    peer_id: overlay_ip.segments()[6] as u32,
                     my_coords: self_coords,
                     my_load: 0,
                 };

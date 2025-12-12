@@ -1,0 +1,14 @@
+[package]
+name = "axiomd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tun = "0.6"
+socket2 = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"

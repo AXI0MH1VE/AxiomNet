@@ -1,0 +1,15 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

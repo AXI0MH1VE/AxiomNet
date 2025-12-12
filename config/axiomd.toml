@@ -1,0 +1,14 @@
+# Example configuration for Axiom Daemon
+[network]
+interface = "ax0"
+mtu = 1280
+listen_port = 51820
+
+[crypto]
+key_file = "./config/identity.key"
+
+[routing]
+dht_bootstrap_nodes = []
+
+[logging]
+level = "info"

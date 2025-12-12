@@ -3,7 +3,7 @@ use snow::TransportState;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-#[derive(Clone)]
+// Note: TransportState cannot be cloned due to cryptographic state
 pub struct Peer {
     pub addr: SocketAddr,
     pub transport: TransportState,
@@ -29,8 +29,13 @@ impl PeerManager {
         self.peers.insert(addr, peer);
     }
 
-    pub fn get(&self, addr: &SocketAddr) -> Option<Peer> {
-        self.peers.get(addr).map(|p| p.clone())
+    // Note: Cannot return cloned Peer since TransportState is not Clone
+    // Callers should use with_peer() to access peer data
+    pub fn with_peer<F, R>(&self, addr: &SocketAddr, f: F) -> Option<R>
+    where
+        F: FnOnce(&Peer) -> R,
+    {
+        self.peers.get(addr).map(|p| f(p.value()))
     }
 
     pub fn remove(&self, addr: &SocketAddr) {

@@ -1,6 +1,10 @@
 use anyhow::{Result, Context};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+#[cfg(test)]
+#[path = "protocol_tests.rs"]
+mod protocol_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
     Data = 0,
@@ -45,10 +49,28 @@ impl SwitchHeader {
     }
 
     pub fn decode(buf: &mut Bytes) -> Result<Self> {
+        // Check minimum header size to prevent underflow panics
+        if buf.remaining() < 16 {
+            anyhow::bail!(
+                "Packet too short: expected at least 16 bytes for header, got {}",
+                buf.len()
+            );
+        }
+        
         let route_label = buf.get_u32();
         let vt = buf.get_u8();
         let version = (vt & 0xF0) >> 4;
-        let packet_type = PacketType::from_u8(vt & 0x0F).context("Invalid packet type")?;
+        let packet_type = PacketType::from_u8(vt & 0x0F)
+            .context("Invalid packet type")?;
+        
+        // Verify remaining bytes for receiver_index (3 bytes) and counter (8 bytes)
+        if buf.remaining() < 11 {
+            anyhow::bail!(
+                "Packet truncated: expected 11 more bytes for receiver_index and counter, got {}",
+                buf.remaining()
+            );
+        }
+        
         let b1 = buf.get_u8();
         let b2 = buf.get_u8();
         let b3 = buf.get_u8();

@@ -5,16 +5,14 @@
 //!   axiomd --bind 0.0.0.0:9001 --tun ax1
 
 mod tun_adapter;
-mod protocol;
-mod router;
-mod identity;
-mod session;
-mod transport;
-mod topology;
-mod control;
-mod crypto;
-mod peer;
+mod dht;
+mod routing;
+mod tun;
+mod udp;
+mod noise;
+mod wasm;
 
+use axiomd::{protocol, router, identity, session, transport, topology, control, crypto, peer};
 use anyhow::Result;
 use clap::Parser;
 use dashmap::DashMap;
@@ -132,7 +130,8 @@ impl AxiomNode {
 
     /// Handle inbound UDP packet (decryption, routing, etc.)
     async fn handle_inbound_udp(&self, data: &[u8], from: SocketAddr) -> Result<()> {
-        let packet = AxiomPacket::decode(bytes::Bytes::copy_from_slice(data))?;
+        let packet = AxiomPacket::decode(bytes::Bytes::copy_from_slice(data))
+            .context("Failed to decode packet")?;
 
         match packet.header.packet_type {
             PacketType::Handshake => {
@@ -227,7 +226,11 @@ impl AxiomNode {
                         control::handle_control_packet(&msg, from, &self.router);
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to deserialize control message: {}", e);
+                        tracing::warn!(
+                            from = %from,
+                            error = %e,
+                            "Failed to deserialize control message"
+                        );
                     }
                 }
             }
@@ -475,7 +478,15 @@ impl AxiomNode {
                     let encoded = packet.encode();
 
                     for peer_entry in router.get_peers() {
-                        let _ = udp.send_to(&encoded, peer_entry.1.addr).await;
+                        // Log errors instead of silently ignoring for better observability
+                        if let Err(e) = udp.send_to(&encoded, peer_entry.1.addr).await {
+                            tracing::warn!(
+                                peer_addr = %peer_entry.1.addr,
+                                peer_id = %peer_entry.0,
+                                error = %e,
+                                "Failed to send heartbeat to peer"
+                            );
+                        }
                     }
                 }
             }
@@ -496,44 +507,31 @@ impl AxiomNode {
         tokio::select! {
             result = async {
                 loop {
-                    tokio::select! {
-                        // UDP recv
-                        udp_result = self.udp_socket.recv_from(&mut udp_buf) => {
-                            match udp_result {
-                                Ok((n, from)) => {
-                                    let buf = udp_buf[..n].to_vec();
-                                    let data = bytes::Bytes::from(buf);
-                                    if let Err(e) = self.handle_inbound_udp(&data, from).await {
-                                        tracing::debug!("UDP handler error: {}", e);
-                                    }
+                    // Add timeout to UDP recv to allow periodic shutdown signal checking
+                    // and prevent indefinite blocking
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        self.udp_socket.recv_from(&mut udp_buf)
+                    ).await {
+                        Ok(Ok((n, from))) => {
+                            let buf = udp_buf[..n].to_vec();
+                            let this = self;
+                            let _ = tokio::spawn(async move {
+                                if let Err(e) = this.handle_inbound_udp(&buf, from).await {
+                                    tracing::debug!(
+                                        from = %from,
+                                        error = %e,
+                                        "Error handling inbound UDP packet"
+                                    );
                                 }
-                                Err(e) => {
-                                    tracing::error!("UDP recv error: {}", e);
-                                }
-                            }
+                            }).await;
                         }
-                        
-                        // TUN read (if device available)
-                        tun_result = async {
-                            if let Some(dev) = &tun_dev {
-                                let mut dev_clone = dev.clone();
-                                dev_clone.read(&mut tun_buf).await
-                            } else {
-                                std::future::pending().await
-                            }
-                        }, if tun_dev.is_some() => {
-                            match tun_result {
-                                Ok(n) if n > 0 => {
-                                    let buf = tun_buf[..n].to_vec();
-                                    if let Err(e) = self.handle_inbound_tun(&buf).await {
-                                        tracing::debug!("TUN handler error: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("TUN read error: {}", e);
-                                }
-                                _ => {}
-                            }
+                        Ok(Err(e)) => {
+                            tracing::error!("UDP recv error: {}", e);
+                        }
+                        Err(_) => {
+                            // Timeout - this is normal, allows checking for shutdown
+                            tracing::trace!("UDP recv timeout, checking for shutdown signal");
                         }
                     }
                 }

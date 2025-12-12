@@ -20,8 +20,9 @@ impl NodeIdentity {
             };
             Ok(Self { static_keypair })
         } else {
-            let builder = Builder::new(NOISE_PARAMS.parse().unwrap());
-            let static_keypair = builder.generate_keypair().unwrap();
+            let params: NoiseParams = NOISE_PARAMS.parse().context("Invalid Noise params")?;
+            let builder = Builder::new(params);
+            let static_keypair = builder.generate_keypair().context("Failed to generate static keypair")?;
             let mut key_bytes = Vec::new();
             key_bytes.extend_from_slice(&static_keypair.private);
             key_bytes.extend_from_slice(&static_keypair.public);
@@ -41,7 +42,8 @@ pub struct HandshakeManager {
 
 impl HandshakeManager {
     pub fn initiator(local: &NodeIdentity, remote_pub: &[u8]) -> Result<Self> {
-        let builder = Builder::new(NOISE_PARAMS.parse().unwrap())
+        let params: NoiseParams = NOISE_PARAMS.parse().context("Invalid Noise params")?;
+        let builder = Builder::new(params)
             .local_private_key(&local.static_keypair.private)
             .remote_public_key(remote_pub);
         let state = builder.build_initiator()?;
@@ -49,7 +51,8 @@ impl HandshakeManager {
     }
 
     pub fn responder(local: &NodeIdentity) -> Result<Self> {
-        let builder = Builder::new(NOISE_PARAMS.parse().unwrap())
+        let params: NoiseParams = NOISE_PARAMS.parse().context("Invalid Noise params")?;
+        let builder = Builder::new(params)
             .local_private_key(&local.static_keypair.private);
         let state = builder.build_responder()?;
         Ok(Self { state })

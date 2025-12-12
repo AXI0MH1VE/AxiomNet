@@ -22,3 +22,4 @@ clap = { version = "4.5", features = ["derive"] }
 num-complex = "0.4"
 rand = "0.8"
 hex = "0.4"
+parking_lot = "0.12"

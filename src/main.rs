@@ -1,4 +1,9 @@
-//! Axiom Daemon Entry Point
+//! Axiom Daemon - Layer 3 Overlay Network with Hyperbolic Routing
+//!
+//! Usage:
+//!   axiomd --bind 0.0.0.0:9000 --tun ax0 --peer 127.0.0.1:9001
+//!   axiomd --bind 0.0.0.0:9001 --tun ax1
+
 mod tun_adapter;
 mod protocol;
 mod router;
@@ -7,166 +12,373 @@ mod session;
 mod transport;
 mod topology;
 mod control;
+mod crypto;
+mod peer;
 
 use anyhow::Result;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use tokio::signal;
-use tracing_subscriber::{fmt, EnvFilter};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use once_cell::sync::Lazy;
 use clap::Parser;
+use dashmap::DashMap;
+use protocol::{AxiomPacket, PacketType, SwitchHeader};
+use router::RoutingTable;
+use session::Session;
+use std::net::{Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
+use tokio::signal;
+use topology::Coordinates;
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(name = "axiomd")]
+#[command(author = "Axiom Network")]
+#[command(about = "Axiom Layer 3 Overlay Network Daemon", long_about = None)]
 struct Cli {
+    /// UDP bind address (e.g., 0.0.0.0:9000)
     #[arg(long, default_value = "0.0.0.0:9000")]
     bind: String,
+
+    /// TUN interface name (e.g., ax0)
     #[arg(long, default_value = "ax0")]
     tun: String,
+
+    /// Bootstrap peer address (e.g., 127.0.0.1:9000)
     #[arg(long)]
     peer: Option<String>,
+
+    /// Secret key as hex string (if not provided, generates new identity)
     #[arg(long)]
     secret_key: Option<String>,
+
+    /// Node ID (for logging/identification)
+    #[arg(long, default_value = "node-1")]
+    node_id: String,
+}
+
+struct AxiomNode {
+    cli: Cli,
+    router: Arc<RoutingTable>,
+    sessions: Arc<DashMap<u32, Session>>,
+    session_counter: Arc<AtomicU32>,
+    udp_socket: Arc<UdpSocket>,
+    keypair: crypto::NodeIdentity,
+    overlay_ip: Ipv6Addr,
+    self_coords: Coordinates,
+}
+
+impl AxiomNode {
+    async fn new(cli: Cli) -> Result<Self> {
+        // 1. Initialize Crypto & Identity
+        let keypair = if let Some(hex_key) = &cli.secret_key {
+            crypto::NodeIdentity::load_from_hex(hex_key)?
+        } else {
+            crypto::NodeIdentity::load_or_generate("./config/identity.key")?
+        };
+
+        let public_key = &keypair.static_keypair.public;
+        let overlay_ip = identity::generate_axiom_address(public_key)?;
+
+        tracing::info!(
+            "Node: {} | Overlay IPv6: {} | Public Key: {}",
+            cli.node_id,
+            overlay_ip,
+            keypair.public_base64()
+        );
+
+        // 2. Initialize Routing Table
+        let router = Arc::new(RoutingTable::new(overlay_ip));
+
+        // 3. Bind UDP Transport
+        let udp_socket = Arc::new(UdpSocket::bind(&cli.bind).await?);
+        tracing::info!("UDP bound to: {}", udp_socket.local_addr()?);
+
+        // 4. Initialize Session Storage
+        let sessions = Arc::new(DashMap::new());
+        let session_counter = Arc::new(AtomicU32::new(1));
+
+        // 5. Initialize Self Coordinates (random for now)
+        let mut self_coords = Coordinates {
+            r: rand::random::<f64>() * 0.95, // Stay away from boundary
+            theta: rand::random::<f64>() * std::f64::consts::TAU,
+        };
+        self_coords.normalize();
+        router.set_self_coords(self_coords);
+
+        tracing::info!(
+            "Self coordinates: r={:.4}, theta={:.4}",
+            self_coords.r,
+            self_coords.theta
+        );
+
+        Ok(Self {
+            cli,
+            router,
+            sessions,
+            session_counter,
+            udp_socket,
+            keypair,
+            overlay_ip,
+            self_coords,
+        })
+    }
+
+    /// Get next session ID
+    fn next_session_id(&self) -> u32 {
+        self.session_counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Handle inbound UDP packet (decryption, routing, etc.)
+    async fn handle_inbound_udp(&self, data: &[u8], from: SocketAddr) -> Result<()> {
+        let packet = AxiomPacket::decode(bytes::Bytes::copy_from_slice(data))?;
+
+        match packet.header.packet_type {
+            PacketType::Handshake => {
+                tracing::debug!("Handshake packet from {}", from);
+                // TODO: Process Noise Protocol handshake
+            }
+            PacketType::Data => {
+                tracing::debug!("Data packet from {}", from);
+                // TODO: Process data packet through established session
+            }
+            PacketType::Control => {
+                // Parse and handle control message
+                match bincode::deserialize::<control::ControlMessage>(&packet.payload) {
+                    Ok(msg) => {
+                        control::handle_control_packet(&msg, from, &self.router);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize control message: {}", e);
+                    }
+                }
+            }
+            PacketType::Keepalive => {
+                tracing::trace!("Keepalive from {}", from);
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Handle inbound TUN packet (encryption, routing)
+    async fn handle_inbound_tun(&self, data: &[u8]) -> Result<()> {
+        if data.len() < 40 {
+            return Ok(());
+        }
+
+        // Extract destination IPv6 from packet (40 bytes into IPv6 header)
+        let dest_ip = Ipv6Addr::new(
+            u16::from_be_bytes([data[24], data[25]]),
+            u16::from_be_bytes([data[26], data[27]]),
+            u16::from_be_bytes([data[28], data[29]]),
+            u16::from_be_bytes([data[30], data[31]]),
+            u16::from_be_bytes([data[32], data[33]]),
+            u16::from_be_bytes([data[34], data[35]]),
+            u16::from_be_bytes([data[36], data[37]]),
+            u16::from_be_bytes([data[38], data[39]]),
+        );
+
+        tracing::trace!("TUN packet to {}", dest_ip);
+
+        // Check if destination is local
+        if self.router.is_local(&dest_ip) {
+            tracing::debug!("Destination is local");
+            return Ok(());
+        }
+
+        // Try direct route
+        if let Some(next_hop) = self.router.lookup(&dest_ip) {
+            tracing::debug!("Direct route to {} via {}", dest_ip, next_hop);
+            // TODO: Send via established session
+            return Ok(());
+        }
+
+        // Use greedy routing
+        let peers = self.router.get_peers();
+        if peers.is_empty() {
+            tracing::warn!("No peers available for routing");
+            return Ok(());
+        }
+
+        // Assume destination coordinates from IP (in real implementation, use DHT)
+        let dest_coords = Coordinates {
+            r: 0.7,
+            theta: (dest_ip.segments()[0] as f64 / 65535.0) * std::f64::consts::TAU,
+        };
+
+        let neighbor_list: Vec<_> = peers
+            .iter()
+            .map(|(id, entry)| (*id, entry.coords))
+            .collect();
+
+        if let Some(next_peer_id) = topology::find_greedy_hop(dest_coords, neighbor_list) {
+            if let Some(peer) = self.router.get_peer(next_peer_id) {
+                tracing::debug!(
+                    "Greedy route to {} via peer {} at {}",
+                    dest_ip, next_peer_id, peer.addr
+                );
+                // TODO: Forward via session to next_peer_id
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Broadcast heartbeat to all connected peers
+    async fn broadcast_heartbeat(&self) -> Result<()> {
+        let msg = control::ControlMessage::Heartbeat {
+            peer_id: u32::from_ne_bytes(self.overlay_ip.segments()[6].to_ne_bytes()),
+            my_coords: self.self_coords,
+            my_load: 0, // TODO: Calculate actual node load
+        };
+
+        let payload = bincode::serialize(&msg)?;
+
+        let header = SwitchHeader {
+            route_label: 0,
+            version: 1,
+            packet_type: PacketType::Control,
+            receiver_index: 0,
+            counter: 0,
+        };
+
+        let packet = AxiomPacket {
+            header,
+            payload: bytes::Bytes::from(payload),
+        };
+
+        let encoded = packet.encode();
+
+        for peer_entry in self.router.get_peers() {
+            if let Err(e) = self.udp_socket.send_to(&encoded, peer_entry.1.addr).await {
+                tracing::warn!("Failed to send heartbeat to {}: {}", peer_entry.1.addr, e);
+            }
+        }
+
+        tracing::debug!("Broadcast heartbeat to {} peers", self.router.get_peers().len());
+        Ok(())
+    }
+
+    /// Bootstrap with a peer if provided
+    async fn bootstrap_peer(&self, peer_addr: &str) -> Result<()> {
+        let socket_addr: SocketAddr = peer_addr.parse()?;
+        tracing::info!("Bootstrapping with peer: {}", socket_addr);
+
+        let peer_id = self.next_session_id();
+        let peer_coords = Coordinates {
+            r: 0.6,
+            theta: std::f64::consts::PI,
+        };
+
+        self.router
+            .add_peer(peer_id, socket_addr, peer_coords);
+
+        // TODO: Initiate Noise Protocol handshake with peer
+        Ok(())
+    }
+
+    /// Main event loop
+    async fn run(&self) -> Result<()> {
+        // Bootstrap if peer provided
+        if let Some(peer_addr) = &self.cli.peer {
+            self.bootstrap_peer(peer_addr).await?;
+        }
+
+        // Spawn heartbeat task
+        let router = self.router.clone();
+        let udp = self.udp_socket.clone();
+        let self_coords = self.self_coords;
+        let overlay_ip = self.overlay_ip;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let msg = control::ControlMessage::Heartbeat {
+                    peer_id: u32::from_ne_bytes(overlay_ip.segments()[6].to_ne_bytes()),
+                    my_coords: self_coords,
+                    my_load: 0,
+                };
+
+                if let Ok(payload) = bincode::serialize(&msg) {
+                    let header = SwitchHeader {
+                        route_label: 0,
+                        version: 1,
+                        packet_type: PacketType::Control,
+                        receiver_index: 0,
+                        counter: 0,
+                    };
+
+                    let packet = AxiomPacket {
+                        header,
+                        payload: bytes::Bytes::from(payload),
+                    };
+
+                    let encoded = packet.encode();
+
+                    for peer_entry in router.get_peers() {
+                        let _ = udp.send_to(&encoded, peer_entry.1.addr).await;
+                    }
+                }
+            }
+        });
+
+        // Main event loop
+        let mut udp_buf = vec![0u8; 65535];
+        let mut tun_buf = vec![0u8; 1500];
+
+        let shutdown = async {
+            let _ = signal::ctrl_c().await;
+            tracing::info!("Received shutdown signal");
+        };
+
+        tokio::select! {
+            result = async {
+                loop {
+                    match self.udp_socket.recv_from(&mut udp_buf).await {
+                        Ok((n, from)) => {
+                            let buf = udp_buf[..n].to_vec();
+                            let this = self;
+                            let _ = tokio::spawn(async move {
+                                let _ = this.handle_inbound_udp(&buf, from).await;
+                            }).await;
+                        }
+                        Err(e) => {
+                            tracing::error!("UDP recv error: {}", e);
+                        }
+                    }
+                }
+            } => {
+                tracing::info!("UDP loop exited");
+                result
+            }
+            _ = shutdown => {
+                tracing::info!("Shutting down...");
+                Ok(())
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // CLI
-    let cli = Cli::parse();
+    // Initialize logging
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
-    tracing::info!("Starting axiomd daemon...");
 
-    // Identity
-    let keypair = if let Some(hex) = cli.secret_key {
-        // TODO: Load from hex
-        crypto::NodeIdentity::load_or_generate("./config/identity.key")?
-    } else {
-        crypto::NodeIdentity::load_or_generate("./config/identity.key")?
-    };
-    let public_key = &keypair.static_keypair.public;
-    let overlay_ip = identity::generate_axiom_address(public_key)?;
-    tracing::info!("Node overlay IPv6: {}", overlay_ip);
+    // Parse CLI arguments
+    let cli = Cli::parse();
 
-    // TUN
-    let mtu = 1280;
-    let address = Ipv4Addr::new(10, 0, 0, 1);
-    let netmask = Ipv4Addr::new(255, 255, 255, 0);
-    let adapter = tun_adapter::TunAdapter::new(&cli.tun, mtu, address, netmask)?;
-    tracing::info!("TUN device {} created (MTU {})", adapter.name(), adapter.mtu());
-    let mut dev = adapter.into_inner();
+    tracing::info!(
+        "=== Axiom Network Daemon ===\nNode: {}\nBind: {}\nTUN: {}",
+        cli.node_id, cli.bind, cli.tun
+    );
 
-    // UDP
-    let udp = transport::UdpTransport::bind(&cli.bind).await?;
-    tracing::info!("UDP transport bound to {}", udp.local_addr()?);
-
-    // Routing table
-    let router = router::RoutingTable::new(overlay_ip);
-
-    // Session management
-    use dashmap::DashMap;
-    use std::sync::Arc;
-    let sessions: Arc<DashMap<u32, session::Session>> = Arc::new(DashMap::new());
-
-    // Topology: assign coordinates (for demo, random)
-    use topology::Coordinates;
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let my_coords = Coordinates { r: rng.gen_range(0.0..0.99), theta: rng.gen_range(0.0..std::f64::consts::TAU) };
-
-    // Bootstrap peer if provided
-    if let Some(peer_addr) = cli.peer {
-        let peer_sock: SocketAddr = peer_addr.parse().expect("Invalid peer address");
-        // TODO: Initiate handshake with peer_sock
-        // router.add_route(peer_overlay_ip, peer_sock);
-    }
-
-    // Heartbeat task
-    let router_clone = router.clone();
-    let my_coords_clone = my_coords;
-    tokio::spawn(async move {
-        loop {
-            let msg = control::ControlMessage::Heartbeat { my_coords: my_coords_clone, my_load: 0 };
-            // TODO: Broadcast to all peers
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    });
-
-    // Main event loop
-    let mut tun_buf = vec![0u8; mtu];
-    let mut udp_buf = vec![0u8; 65535];
-
-    let shutdown = async {
-        signal::ctrl_c().await.expect("failed to listen for event");
-        tracing::info!("Received shutdown signal, exiting...");
-    };
-
-    tokio::select! {
-        _ = async {
-            loop {
-                // Inbound UDP
-                let (header, n, from) = udp.recv_packet(&mut udp_buf).await?;
-                let axiom_packet = protocol::AxiomPacket::decode(bytes::Bytes::copy_from_slice(&udp_buf[..n]))?;
-                match axiom_packet.header.packet_type {
-                    protocol::PacketType::Handshake => {
-                        // Handshake logic
-                        if let Some(mut sess) = sessions.get_mut(&axiom_packet.header.receiver_index) {
-                            let _ = sess.process_incoming(axiom_packet)?;
-                        } else {
-                            // New handshake: create Session in Handshaking state
-                        }
-                    }
-                    protocol::PacketType::Data => {
-                        if let Some(mut sess) = sessions.get_mut(&axiom_packet.header.receiver_index) {
-                            let decrypted = sess.process_incoming(axiom_packet)?;
-                            dev.write_all(&decrypted).await?;
-                        }
-                    }
-                    protocol::PacketType::Control => {
-                        // Parse and handle control message
-                        if let Ok(msg) = bincode::deserialize::<control::ControlMessage>(&axiom_packet.payload) {
-                            control::handle_control_packet(&msg, axiom_packet.header.receiver_index, &router);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        } => {},
-        _ = async {
-            loop {
-                // Inbound TUN
-                let n = dev.read(&mut tun_buf).await?;
-                if n == 0 { continue; }
-                // Extract dest IPv6 from packet (real extraction needed)
-                let dest_ip = Ipv6Addr::from([0xfc,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2]);
-                // Routing: direct or greedy
-                let next_hop = if let Some(hop) = router.lookup(&dest_ip) {
-                    Some(hop)
-                } else {
-                    // Greedy routing
-                    let neighbors = vec![]; // TODO: gather from router
-                    topology::find_greedy_hop(/*target*/my_coords, neighbors).map(|id| router.lookup(&id)).flatten()
-                };
-                if let Some(next_hop) = next_hop {
-                    // Find or create session
-                    let receiver_index = 1; // For demo, static
-                    let mut sess = sessions.entry(receiver_index).or_insert_with(|| {
-                        let dummy_hs = snow::Builder::new("Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap()).build_initiator().unwrap();
-                        session::Session::new_handshaking(dummy_hs, receiver_index, receiver_index)
-                    });
-                    if sess.is_established() {
-                        let axiom_packet = sess.encrypt_outgoing(&tun_buf[..n])?;
-                        udp.send_packet(&axiom_packet.header, &axiom_packet.payload, &next_hop).await?;
-                    } else {
-                        // Not established: trigger handshake
-                    }
-                }
-            }
-        } => {},
-        _ = shutdown => {},
-    }
+    // Create and run the node
+    let node = AxiomNode::new(cli).await?;
+    node.run().await?;
 
     Ok(())
 }

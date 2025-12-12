@@ -1,5 +1,9 @@
 use std::f64::consts::PI;
 
+#[cfg(test)]
+#[path = "topology_tests.rs"]
+mod topology_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Coordinates {
     pub r: f64,      // [0, 1) - radial distance in Poincaré disk

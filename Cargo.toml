@@ -8,7 +8,7 @@ tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "net", "io-
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-tun = "0.6"
+tun = { version = "0.6", features = ["async"] }
 socket2 = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
@@ -18,6 +18,7 @@ dashmap = "5.5"
 bytes = "1.5"
 blake2 = "0.10"
 once_cell = "1.19"
+hex = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 num-complex = "0.4"
 rand = "0.8"

@@ -1,6 +1,6 @@
 use anyhow::{Result, Context};
 use base64::{engine::general_purpose, Engine as _};
-use snow::{Builder, HandshakeState, params::NoiseParams, types::Dh, Keypair, TransportState};
+use snow::{Builder, HandshakeState, params::NoiseParams, Keypair, TransportState};
 use std::fs;
 use std::path::Path;
 
@@ -11,6 +11,18 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
+    pub fn load_from_hex(hex_key: &str) -> Result<Self> {
+        let bytes = hex::decode(hex_key.trim())?;
+        if bytes.len() != 64 {
+            anyhow::bail!("Hex key must be 64 bytes (private||public)");
+        }
+        let static_keypair = Keypair {
+            private: bytes[..32].try_into().context("Invalid private key length")?,
+            public: bytes[32..].try_into().context("Invalid public key length")?,
+        };
+        Ok(Self { static_keypair })
+    }
+
     pub fn load_or_generate<P: AsRef<Path>>(path: P) -> Result<Self> {
         if path.as_ref().exists() {
             let key_bytes = fs::read(path)?;

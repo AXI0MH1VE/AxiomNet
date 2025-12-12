@@ -1,4 +1,4 @@
-use anyhow::{Result, Context};
+use anyhow::Result;
 use blake2::{Blake2s256, Digest};
 use std::net::Ipv6Addr;
 

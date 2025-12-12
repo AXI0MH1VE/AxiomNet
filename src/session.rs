@@ -1,11 +1,11 @@
-use anyhow::{Result, Context};
+use anyhow::Result;
 use snow::{HandshakeState, TransportState};
 use crate::protocol::{AxiomPacket, SwitchHeader, PacketType};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub enum SessionState {
-    Handshaking(HandshakeState),
+    Handshaking(Option<HandshakeState>),
     Established(TransportState),
 }
 
@@ -20,7 +20,7 @@ pub struct Session {
 impl Session {
     pub fn new_handshaking(hs: HandshakeState, receiver_index: u32, remote_index: u32) -> Self {
         Self {
-            state: SessionState::Handshaking(hs),
+            state: SessionState::Handshaking(Some(hs)),
             receiver_index,
             remote_index,
             send_counter: AtomicU64::new(0),
@@ -43,11 +43,13 @@ impl Session {
 
     pub fn process_incoming(&mut self, packet: AxiomPacket) -> Result<Bytes> {
         match &mut self.state {
-            SessionState::Handshaking(hs) => {
+            SessionState::Handshaking(hs_opt) => {
+                let hs = hs_opt.as_mut().ok_or_else(|| anyhow::anyhow!("Handshake state missing"))?;
                 let mut out = [0u8; 2048];
                 let n = hs.read_message(&packet.payload, &mut out)?;
                 if hs.is_handshake_finished() {
-                    let ts = hs.clone().into_transport_mode()?;
+                    let hs_owned = hs_opt.take().ok_or_else(|| anyhow::anyhow!("Handshake already taken"))?;
+                    let ts = hs_owned.into_transport_mode()?;
                     self.state = SessionState::Established(ts);
                 }
                 Ok(Bytes::copy_from_slice(&out[..n]))

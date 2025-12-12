@@ -1,9 +1,9 @@
-use anyhow::Result;
 use dashmap::DashMap;
 use snow::TransportState;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct Peer {
     pub addr: SocketAddr,
     pub transport: TransportState,

@@ -63,6 +63,12 @@ impl Coordinates {
 }
 
 /// Find the neighbor with the minimum hyperbolic distance to the target
+/// 
+/// Returns None if the neighbor list is empty.
+/// 
+/// Note: Uses `partial_cmp` with `unwrap_or(Equal)` to handle NaN distances
+/// that may occur from invalid coordinates. NaN distances are treated as equal,
+/// preventing them from being selected as the minimum.
 pub fn find_greedy_hop<T: Copy>(target: Coordinates, neighbors: Vec<(T, Coordinates)>) -> Option<T> {
     if neighbors.is_empty() {
         return None;
@@ -73,6 +79,7 @@ pub fn find_greedy_hop<T: Copy>(target: Coordinates, neighbors: Vec<(T, Coordina
         .min_by(|(_, c1), (_, c2)| {
             let d1 = c1.hyperbolic_distance(&target);
             let d2 = c2.hyperbolic_distance(&target);
+            // Handle NaN by treating as equal (prevents NaN from being minimum)
             d1.partial_cmp(&d2).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(id, _)| id)

@@ -12,3 +12,6 @@ tun = "0.6"
 socket2 = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
+snow = "0.9"
+base64 = "0.22"
+dashmap = "5.5"

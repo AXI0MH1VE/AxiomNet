@@ -315,7 +315,10 @@ impl AxiomNode {
                 loop {
                     match self.udp_socket.recv_from(&mut udp_buf).await {
                         Ok((n, from)) => {
-                            // Process inline to avoid allocation and spawning overhead
+                            // Process inline to avoid allocation and spawning overhead.
+                            // NOTE: This blocks the receive loop, which is acceptable for current
+                            // workload but may need to be changed to a channel + worker pool
+                            // pattern if packet processing becomes more CPU-intensive.
                             if let Err(e) = self.handle_inbound_udp(&udp_buf[..n], from).await {
                                 tracing::warn!("Failed to handle UDP packet from {}: {}", from, e);
                             }

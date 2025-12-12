@@ -1,14 +1,17 @@
 //! Axiom Daemon Entry Point
 mod tun_adapter;
-mod crypto;
+mod protocol;
+mod router;
+mod identity;
+mod session;
 mod transport;
-mod peer;
 
 use anyhow::Result;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::signal;
 use tracing_subscriber::{fmt, EnvFilter};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use once_cell::sync::Lazy;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,53 +23,41 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting axiomd daemon...");
 
+    // Load/generate Ed25519 keypair (reuse from previous phases or implement as needed)
+    let keypair = crypto::NodeIdentity::load_or_generate("./config/identity.key")?;
+    let public_key = &keypair.static_keypair.public;
+    let overlay_ip = identity::generate_axiom_address(public_key)?;
+    tracing::info!("Node overlay IPv6: {}", overlay_ip);
+
     // TUN interface config
     let tun_name = "ax0";
     let mtu = 1280;
-    let address = Ipv4Addr::new(10, 0, 0, 1);
+    let address = Ipv4Addr::new(10, 0, 0, 1); // For TUN config only
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
-
     let adapter = tun_adapter::TunAdapter::new(tun_name, mtu, address, netmask)?;
     tracing::info!("TUN device {} created (MTU {})", adapter.name(), adapter.mtu());
-
     let mut dev = adapter.into_inner();
-
-    // Crypto identity
-    let identity = crypto::NodeIdentity::load_or_generate("./config/identity.key")?;
-    tracing::info!("Node public key: {}", identity.public_base64());
 
     // UDP transport
     let udp_addr = "0.0.0.0:40000";
     let udp = transport::UdpTransport::bind(udp_addr).await?;
     tracing::info!("UDP transport bound to {}", udp.local_addr()?);
 
-    // Peer manager
-    let peer_manager = peer::PeerManager::new();
+    // Routing table
+    let router = router::RoutingTable::new(overlay_ip);
+
+    // Session management: DashMap<ReceiverIndex, Session>
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    let sessions: Arc<DashMap<u32, session::Session>> = Arc::new(DashMap::new());
 
     // For demo: hardcode remote peer (replace with real IP/port for test)
     let remote_addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
-    // In real use, exchange public keys out-of-band
     let remote_pub = [0u8; 32]; // Replace with actual remote pubkey for real test
+    let remote_overlay_ip = identity::generate_axiom_address(&remote_pub)?;
+    router.add_route(remote_overlay_ip, remote_addr);
 
-    // Handshake as initiator (for demo)
-    let mut handshake = crypto::HandshakeManager::initiator(&identity, &remote_pub)?;
-    let mut buf = [0u8; 65535];
-    let mut msg = [0u8; 65535];
-    // -> e
-    let len = handshake.write_message(&[], &mut msg)?;
-    udp.send_packet(&transport::PacketHeader { version: 1, packet_type: 2, counter: 0 }, &msg[..len], &remote_addr).await?;
-    // <- e, ee, s, es
-    let (header, n, from) = udp.recv_packet(&mut buf).await?;
-    let _ = handshake.read_message(&buf[std::mem::size_of::<transport::PacketHeader>()..n], &mut msg)?;
-    // -> s, se
-    let len = handshake.write_message(&[], &mut msg)?;
-    udp.send_packet(&transport::PacketHeader { version: 1, packet_type: 2, counter: 1 }, &msg[..len], &remote_addr).await?;
-    assert!(handshake.is_handshake_finished());
-    let transport_state = handshake.into_transport()?;
-    peer_manager.insert(remote_addr, peer::Peer::new(remote_addr, transport_state));
-    tracing::info!("Handshake complete with {}", remote_addr);
-
-    // Event loop: select between TUN and UDP
+    // Main event loop
     let mut tun_buf = vec![0u8; mtu];
     let mut udp_buf = vec![0u8; 65535];
 
@@ -80,9 +71,24 @@ async fn main() -> Result<()> {
             loop {
                 // Inbound UDP
                 let (header, n, from) = udp.recv_packet(&mut udp_buf).await?;
-                if let Some(mut peer) = peer_manager.get(&from) {
-                    let decrypted = peer.transport.read_message(&udp_buf[std::mem::size_of::<transport::PacketHeader>()..n])?;
-                    dev.write_all(&decrypted).await?;
+                let axiom_packet = protocol::AxiomPacket::decode(bytes::Bytes::copy_from_slice(&udp_buf[..n]))?;
+                match axiom_packet.header.packet_type {
+                    protocol::PacketType::Handshake => {
+                        // Handshake logic: advance state, promote to Established if done
+                        if let Some(mut sess) = sessions.get_mut(&axiom_packet.header.receiver_index) {
+                            let _ = sess.process_incoming(axiom_packet)?;
+                        } else {
+                            // New handshake: create Session in Handshaking state
+                            // (For demo, not shown: extract remote pubkey, etc.)
+                        }
+                    }
+                    protocol::PacketType::Data => {
+                        if let Some(mut sess) = sessions.get_mut(&axiom_packet.header.receiver_index) {
+                            let decrypted = sess.process_incoming(axiom_packet)?;
+                            dev.write_all(&decrypted).await?;
+                        }
+                    }
+                    _ => {}
                 }
             }
         } => {},
@@ -91,11 +97,23 @@ async fn main() -> Result<()> {
                 // Inbound TUN
                 let n = dev.read(&mut tun_buf).await?;
                 if n == 0 { continue; }
-                // For demo: always send to remote_addr
-                if let Some(mut peer) = peer_manager.get(&remote_addr) {
-                    let mut encrypted = vec![0u8; n + 16];
-                    let len = peer.transport.write_message(&tun_buf[..n], &mut encrypted)?;
-                    udp.send_packet(&transport::PacketHeader { version: 1, packet_type: 0, counter: peer.counter }, &encrypted[..len], &remote_addr).await?;
+                // Extract dest IPv6 from packet (assume IPv6 for demo)
+                let dest_ip = Ipv6Addr::from([0xfc,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2]); // Replace with real extraction
+                if let Some(next_hop) = router.lookup(&dest_ip) {
+                    // Find or create session
+                    let receiver_index = 1; // For demo, static
+                    let mut sess = sessions.entry(receiver_index).or_insert_with(|| {
+                        // If not connected, initiate handshake (not shown: real handshake logic)
+                        // For demo, create dummy established session
+                        let dummy_hs = snow::Builder::new("Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap()).build_initiator().unwrap();
+                        session::Session::new_handshaking(dummy_hs, receiver_index, receiver_index)
+                    });
+                    if sess.is_established() {
+                        let axiom_packet = sess.encrypt_outgoing(&tun_buf[..n])?;
+                        udp.send_packet(&axiom_packet.header, &axiom_packet.payload, &next_hop).await?;
+                    } else {
+                        // Not established: trigger handshake (not shown)
+                    }
                 }
             }
         } => {},

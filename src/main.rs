@@ -165,17 +165,9 @@ impl AxiomNode {
             return Ok(());
         }
 
-        // Extract destination IPv6 from packet (40 bytes into IPv6 header)
-        let dest_ip = Ipv6Addr::new(
-            u16::from_be_bytes([data[24], data[25]]),
-            u16::from_be_bytes([data[26], data[27]]),
-            u16::from_be_bytes([data[28], data[29]]),
-            u16::from_be_bytes([data[30], data[31]]),
-            u16::from_be_bytes([data[32], data[33]]),
-            u16::from_be_bytes([data[34], data[35]]),
-            u16::from_be_bytes([data[36], data[37]]),
-            u16::from_be_bytes([data[38], data[39]]),
-        );
+        // Extract destination IPv6 from packet (bytes 24-40 in IPv6 header)
+        let dest_bytes: [u8; 16] = data[24..40].try_into()?;
+        let dest_ip = Ipv6Addr::from(dest_bytes);
 
         tracing::trace!("TUN packet to {}", dest_ip);
 
@@ -225,9 +217,19 @@ impl AxiomNode {
 
     /// Broadcast heartbeat to all connected peers
     async fn broadcast_heartbeat(&self) -> Result<()> {
+        Self::send_heartbeat(&self.router, &self.udp_socket, self.overlay_ip, self.self_coords).await
+    }
+
+    /// Helper function to send heartbeat (used by both broadcast_heartbeat and heartbeat task)
+    async fn send_heartbeat(
+        router: &RoutingTable,
+        udp_socket: &UdpSocket,
+        overlay_ip: Ipv6Addr,
+        self_coords: Coordinates,
+    ) -> Result<()> {
         let msg = control::ControlMessage::Heartbeat {
-            peer_id: self.overlay_ip.segments()[6] as u32,
-            my_coords: self.self_coords,
+            peer_id: overlay_ip.segments()[6] as u32,
+            my_coords: self_coords,
             my_load: 0, // TODO: Calculate actual node load
         };
 
@@ -248,13 +250,14 @@ impl AxiomNode {
 
         let encoded = packet.encode();
 
-        for peer_entry in self.router.get_peers() {
-            if let Err(e) = self.udp_socket.send_to(&encoded, peer_entry.1.addr).await {
+        let peers = router.get_peers();
+        for peer_entry in &peers {
+            if let Err(e) = udp_socket.send_to(&encoded, peer_entry.1.addr).await {
                 tracing::warn!("Failed to send heartbeat to {}: {}", peer_entry.1.addr, e);
             }
         }
 
-        tracing::debug!("Broadcast heartbeat to {} peers", self.router.get_peers().len());
+        tracing::debug!("Broadcast heartbeat to {} peers", peers.len());
         Ok(())
     }
 
@@ -283,7 +286,7 @@ impl AxiomNode {
             self.bootstrap_peer(peer_addr).await?;
         }
 
-        // Spawn heartbeat task
+        // Spawn heartbeat task - clone necessary fields
         let router = self.router.clone();
         let udp = self.udp_socket.clone();
         let self_coords = self.self_coords;
@@ -292,38 +295,15 @@ impl AxiomNode {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                let msg = control::ControlMessage::Heartbeat {
-                    peer_id: overlay_ip.segments()[6] as u32,
-                    my_coords: self_coords,
-                    my_load: 0,
-                };
-
-                if let Ok(payload) = bincode::serialize(&msg) {
-                    let header = SwitchHeader {
-                        route_label: 0,
-                        version: 1,
-                        packet_type: PacketType::Control,
-                        receiver_index: 0,
-                        counter: 0,
-                    };
-
-                    let packet = AxiomPacket {
-                        header,
-                        payload: bytes::Bytes::from(payload),
-                    };
-
-                    let encoded = packet.encode();
-
-                    for peer_entry in router.get_peers() {
-                        let _ = udp.send_to(&encoded, peer_entry.1.addr).await;
-                    }
+                // Use helper function to avoid code duplication
+                if let Err(e) = Self::send_heartbeat(&router, &udp, overlay_ip, self_coords).await {
+                    tracing::warn!("Failed to send heartbeat: {}", e);
                 }
             }
         });
 
         // Main event loop
         let mut udp_buf = vec![0u8; 65535];
-        let mut tun_buf = vec![0u8; 1500];
 
         let shutdown = async {
             let _ = signal::ctrl_c().await;
@@ -335,11 +315,13 @@ impl AxiomNode {
                 loop {
                     match self.udp_socket.recv_from(&mut udp_buf).await {
                         Ok((n, from)) => {
-                            let buf = udp_buf[..n].to_vec();
-                            let this = self;
-                            let _ = tokio::spawn(async move {
-                                let _ = this.handle_inbound_udp(&buf, from).await;
-                            }).await;
+                            // Process inline to avoid allocation and spawning overhead.
+                            // NOTE: This blocks the receive loop, which is acceptable for current
+                            // workload but may need to be changed to a channel + worker pool
+                            // pattern if packet processing becomes more CPU-intensive.
+                            if let Err(e) = self.handle_inbound_udp(&udp_buf[..n], from).await {
+                                tracing::warn!("Failed to handle UDP packet from {}: {}", from, e);
+                            }
                         }
                         Err(e) => {
                             tracing::error!("UDP recv error: {}", e);

@@ -57,7 +57,7 @@ impl RoutingTable {
     pub fn get_peers(&self) -> Vec<(u32, PeerEntry)> {
         self.peers
             .iter()
-            .map(|entry| (entry.key().clone(), PeerEntry {
+            .map(|entry| (*entry.key(), PeerEntry {
                 addr: entry.value().addr,
                 coords: entry.value().coords,
                 load: entry.value().load,

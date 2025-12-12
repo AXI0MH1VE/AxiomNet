@@ -49,12 +49,8 @@ impl Coordinates {
 
     /// Normalize theta to [0, 2*PI)
     pub fn normalize(&mut self) {
-        while self.theta < 0.0 {
-            self.theta += 2.0 * PI;
-        }
-        while self.theta >= 2.0 * PI {
-            self.theta -= 2.0 * PI;
-        }
+        const TWO_PI: f64 = 2.0 * PI;
+        self.theta = self.theta.rem_euclid(TWO_PI);
     }
 }
 

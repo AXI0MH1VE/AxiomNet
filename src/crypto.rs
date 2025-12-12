@@ -130,7 +130,7 @@ impl NodeIdentity {
 }
 
 pub struct HandshakeManager {
-    state: HandshakeState,
+    pub state: HandshakeState,
 }
 
 impl HandshakeManager {

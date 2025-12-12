@@ -3,6 +3,16 @@ name = "axiomd"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
 [dependencies]
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "time"] }
 anyhow = "1.0"

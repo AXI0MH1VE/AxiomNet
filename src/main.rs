@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::UdpSocket;
 use tokio::signal;
+use tun::Device as TunDevice;
 use topology::Coordinates;
 use tracing_subscriber::{fmt, EnvFilter, prelude::*};
 
@@ -62,6 +63,7 @@ struct AxiomNode {
     keypair: crypto::NodeIdentity,
     overlay_ip: Ipv6Addr,
     self_coords: Coordinates,
+    tun_device: Option<TunDevice>,
 }
 
 impl AxiomNode {
@@ -117,6 +119,7 @@ impl AxiomNode {
             keypair,
             overlay_ip,
             self_coords,
+            tun_device: None,
         })
     }
 
@@ -133,11 +136,88 @@ impl AxiomNode {
         match packet.header.packet_type {
             PacketType::Handshake => {
                 tracing::debug!("Handshake packet from {}", from);
-                // TODO: Process Noise Protocol handshake
+                
+                // Find or create session for this peer
+                let peer_id = packet.header.receiver_index;
+                let remote_index = packet.header.counter as u32;
+                
+                // Check if session exists
+                let session_exists = self.sessions.contains_key(&peer_id);
+                
+                if !session_exists {
+                    // Create new responder session
+                    match crypto::HandshakeManager::responder(&self.keypair) {
+                        Ok(manager) => {
+                            let session = Session::new_handshaking(
+                                manager.state,
+                                peer_id,
+                                remote_index,
+                            );
+                            self.sessions.insert(peer_id, session);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to create responder: {}", e);
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // Process handshake message
+                if let Some(mut session) = self.sessions.get_mut(&peer_id) {
+                    match session.process_incoming(packet) {
+                        Ok(response_bytes) => {
+                            if !response_bytes.is_empty() {
+                                // Send handshake response
+                                let response_packet = AxiomPacket {
+                                    header: SwitchHeader {
+                                        route_label: 0,
+                                        version: 1,
+                                        packet_type: PacketType::Handshake,
+                                        receiver_index: peer_id,
+                                        counter: 0,
+                                    },
+                                    payload: response_bytes,
+                                };
+                                if let Err(e) = self.udp_socket.send_to(&response_packet.encode(), from).await {
+                                    tracing::warn!("Failed to send handshake response: {}", e);
+                                }
+                            }
+
+                            if session.is_established() {
+                                tracing::info!("Session {} established with {}", peer_id, from);
+                                // Update peer info with confirmed address
+                                self.router.add_peer(peer_id, from, self_coords);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Handshake error with {}: {}", from, e);
+                            self.sessions.remove(&peer_id);
+                        }
+                    }
+                }
             }
             PacketType::Data => {
                 tracing::debug!("Data packet from {}", from);
-                // TODO: Process data packet through established session
+                
+                let peer_id = packet.header.receiver_index;
+                if let Some(mut session) = self.sessions.get_mut(&peer_id) {
+                    match session.process_incoming(packet) {
+                        Ok(plaintext) => {
+                            if let Some(dev) = &self.tun_device {
+                                // Write decrypted packet to TUN
+                                let mut dev_clone = dev.clone();
+                                if let Err(e) = tun_adapter::write_tun(&mut dev_clone, &plaintext).await {
+                                    tracing::warn!("Failed to write to TUN: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to decrypt data from {}: {}", from, e);
+                        }
+                    }
+                } else {
+                    tracing::warn!("Data packet from unknown session {}", peer_id);
+                }
             }
             PacketType::Control => {
                 // Parse and handle control message
@@ -191,7 +271,23 @@ impl AxiomNode {
         // Try direct route
         if let Some(next_hop) = self.router.lookup(&dest_ip) {
             tracing::debug!("Direct route to {} via {}", dest_ip, next_hop);
-            // TODO: Send via established session
+            // Try to send via established session
+            if let Some(mut session) = self.sessions.get_mut(&next_hop) {
+                if session.is_established() {
+                    match session.encrypt_outgoing(data) {
+                        Ok(packet) => {
+                            if let Some(peer) = self.router.get_peer(next_hop) {
+                                if let Err(e) = self.udp_socket.send_to(&packet.encode(), peer.addr).await {
+                                    tracing::warn!("Failed to send encrypted packet: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to encrypt outgoing packet: {}", e);
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -214,12 +310,28 @@ impl AxiomNode {
             .collect();
 
         if let Some(next_peer_id) = topology::find_greedy_hop(dest_coords, neighbor_list) {
-            if let Some(peer) = self.router.get_peer(next_peer_id) {
-                tracing::debug!(
-                    "Greedy route to {} via peer {} at {}",
-                    dest_ip, next_peer_id, peer.addr
-                );
-                // TODO: Forward via session to next_peer_id
+            // Check if session is established
+            if let Some(mut session) = self.sessions.get_mut(&next_peer_id) {
+                if session.is_established() {
+                    match session.encrypt_outgoing(data) {
+                        Ok(packet) => {
+                            if let Some(peer) = self.router.get_peer(next_peer_id) {
+                                tracing::debug!(
+                                    "Greedy route to {} via peer {} at {}",
+                                    dest_ip, next_peer_id, peer.addr
+                                );
+                                if let Err(e) = self.udp_socket.send_to(&packet.encode(), peer.addr).await {
+                                    tracing::warn!("Failed to send greedy routed packet: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to encrypt greedy routed packet: {}", e);
+                        }
+                    }
+                } else {
+                    tracing::debug!("Session not yet established for greedy hop {}", next_peer_id);
+                }
             }
         }
 
@@ -275,15 +387,63 @@ impl AxiomNode {
         self.router
             .add_peer(peer_id, socket_addr, peer_coords);
 
-        // TODO: Initiate Noise Protocol handshake with peer
+        // Initiate Noise Protocol handshake with peer
+        match crypto::HandshakeManager::initiator(&self.keypair, &[0u8; 32]) {
+            Ok(mut manager) => {
+                let mut hs_out = [0u8; 256];
+                match manager.write_message(&[], &mut hs_out) {
+                    Ok(n) => {
+                        let session = Session::new_handshaking(
+                            manager.state,
+                            peer_id,
+                            self.next_session_id(),
+                        );
+                        self.sessions.insert(peer_id, session);
+
+                        // Send initial handshake message
+                        let packet = AxiomPacket {
+                            header: SwitchHeader {
+                                route_label: 0,
+                                version: 1,
+                                packet_type: PacketType::Handshake,
+                                receiver_index: peer_id,
+                                counter: 0,
+                            },
+                            payload: bytes::Bytes::copy_from_slice(&hs_out[..n]),
+                        };
+                        self.udp_socket.send_to(&packet.encode(), socket_addr).await?;
+                        tracing::debug!("Sent initial handshake to {}", socket_addr);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to write handshake message: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create handshake initiator: {}", e);
+            }
+        }
+
         Ok(())
     }
 
     /// Main event loop
-    async fn run(&self) -> Result<()> {
+    async fn run(mut self) -> Result<()> {
         // Bootstrap if peer provided
         if let Some(peer_addr) = &self.cli.peer {
             self.bootstrap_peer(peer_addr).await?;
+        }
+
+        // Initialize TUN device
+        let tun_name = &self.cli.tun;
+        match tun_adapter::TunAdapter::new(tun_name, 1500, "fd00::1".parse()?, "ffff:ffff:ffff:ffff::".parse()?) {
+            Ok(adapter) => {
+                self.tun_device = Some(adapter.into_inner());
+                tracing::info!("TUN device {} initialized", tun_name);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize TUN device: {} (running in UDP-only mode)", e);
+            }
         }
 
         // Spawn heartbeat task
@@ -341,6 +501,9 @@ impl AxiomNode {
             tracing::info!("Received shutdown signal");
         };
 
+        // Clone tun device for the loop if available
+        let tun_dev = self.tun_device.clone();
+
         tokio::select! {
             result = async {
                 loop {
@@ -373,7 +536,7 @@ impl AxiomNode {
                     }
                 }
             } => {
-                tracing::info!("UDP loop exited");
+                tracing::info!("Event loop exited");
                 result
             }
             _ = shutdown => {

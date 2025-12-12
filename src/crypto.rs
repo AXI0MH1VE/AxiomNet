@@ -35,7 +35,7 @@ impl NodeIdentity {
             let params: NoiseParams = NOISE_PARAMS.parse().context("Invalid Noise params")?;
             let builder = Builder::new(params);
             let static_keypair = builder.generate_keypair().context("Failed to generate static keypair")?;
-            let mut key_bytes = Vec::new();
+            let mut key_bytes = Vec::with_capacity(64);
             key_bytes.extend_from_slice(&static_keypair.private);
             key_bytes.extend_from_slice(&static_keypair.public);
             fs::write(path, &key_bytes)?;

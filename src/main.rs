@@ -250,13 +250,14 @@ impl AxiomNode {
 
         let encoded = packet.encode();
 
-        for peer_entry in router.get_peers() {
+        let peers = router.get_peers();
+        for peer_entry in &peers {
             if let Err(e) = udp_socket.send_to(&encoded, peer_entry.1.addr).await {
                 tracing::warn!("Failed to send heartbeat to {}: {}", peer_entry.1.addr, e);
             }
         }
 
-        tracing::debug!("Broadcast heartbeat to {} peers", router.get_peers().len());
+        tracing::debug!("Broadcast heartbeat to {} peers", peers.len());
         Ok(())
     }
 

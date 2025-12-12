@@ -15,6 +15,14 @@ pub struct NodeIdentity {
     pub static_keypair: Keypair,
 }
 
+impl std::fmt::Debug for NodeIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeIdentity")
+            .field("public_key", &general_purpose::STANDARD.encode(&self.static_keypair.public))
+            .finish_non_exhaustive()
+    }
+}
+
 impl NodeIdentity {
     pub fn load_from_hex(hex_key: &str) -> Result<Self> {
         let bytes = hex::decode(hex_key.trim())?;
@@ -41,14 +49,10 @@ impl NodeIdentity {
             let key_bytes = fs::read(path)
                 .context("Failed to read identity key file")?;
             
-            // Validate key integrity before using
-            Self::verify_key_integrity(&key_bytes)
+            // Validate key integrity before using and extract keypair
+            let static_keypair = Self::verify_key_integrity(&key_bytes)
                 .context("Identity key file corrupted")?;
             
-            let static_keypair = Keypair {
-                private: key_bytes[..32].try_into().context("Invalid private key length")?,
-                public: key_bytes[32..].try_into().context("Invalid public key length")?,
-            };
             Ok(Self { static_keypair })
         } else {
             let params: NoiseParams = NOISE_PARAMS.parse().context("Invalid Noise params")?;
@@ -80,13 +84,17 @@ impl NodeIdentity {
     }
     
     /// Verify key file integrity
-    fn verify_key_integrity(key_bytes: &[u8]) -> Result<()> {
+    fn verify_key_integrity(key_bytes: &[u8]) -> Result<Keypair> {
         // Check if file has expected format: 64 bytes (key) + 8 bytes (checksum)
         // or legacy format: exactly 64 bytes (no checksum)
         if key_bytes.len() == 64 {
             // Legacy format without checksum - accept but warn
             tracing::warn!("Identity key file uses legacy format without checksum");
-            return Ok(());
+            let static_keypair = Keypair {
+                private: key_bytes[..32].try_into().context("Invalid private key length")?,
+                public: key_bytes[32..].try_into().context("Invalid public key length")?,
+            };
+            return Ok(static_keypair);
         }
         
         if key_bytes.len() != 72 {
@@ -108,7 +116,12 @@ impl NodeIdentity {
             anyhow::bail!("Key file checksum mismatch - file may be corrupted");
         }
         
-        Ok(())
+        let static_keypair = Keypair {
+            private: key_data[..32].try_into().context("Invalid private key length")?,
+            public: key_data[32..].try_into().context("Invalid public key length")?,
+        };
+        
+        Ok(static_keypair)
     }
 
     pub fn public_base64(&self) -> String {

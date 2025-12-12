@@ -5,16 +5,14 @@
 //!   axiomd --bind 0.0.0.0:9001 --tun ax1
 
 mod tun_adapter;
-mod protocol;
-mod router;
-mod identity;
-mod session;
-mod transport;
-mod topology;
-mod control;
-mod crypto;
-mod peer;
+mod dht;
+mod routing;
+mod tun;
+mod udp;
+mod noise;
+mod wasm;
 
+use axiomd::{protocol, router, identity, session, transport, topology, control, crypto, peer};
 use anyhow::Result;
 use clap::Parser;
 use dashmap::DashMap;

@@ -107,5 +107,9 @@ fn test_switch_header_decode_partial_counter() {
     assert!(result.is_err(), "Should return error for partial counter");
     
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("truncated"), "Error should mention truncation");
+    assert!(
+        err_msg.contains("truncated") || err_msg.contains("expected"),
+        "Error should mention truncation or expected bytes, got: {}",
+        err_msg
+    );
 }

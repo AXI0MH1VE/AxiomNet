@@ -1,5 +1,5 @@
 //! Axiom Daemon Entry Point
-mod tun;
+mod tun_adapter;
 mod udp;
 mod noise;
 mod routing;
@@ -23,6 +23,7 @@ async fn main() -> Result<()> {
 
     // TUN interface config
     let tun_name = "ax0";
+    // 1280 is the minimum MTU required by IPv6 (see RFC 8200)
     let mtu = 1280;
     let address = Ipv4Addr::new(10, 0, 0, 1);
     let netmask = Ipv4Addr::new(255, 255, 255, 0);

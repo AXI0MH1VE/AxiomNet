@@ -1,9 +1,11 @@
 // Integration test stubs for Axiom Network
-describe!("Axiom Daemon Integration", {
-    it!("should initialize and create a TUN interface", {
-        // TODO: Implement test
-    });
-    it!("should perform Noise handshake over UDP", {
-        // TODO: Implement test
-    });
-});
+
+#[test]
+fn should_initialize_and_create_a_tun_interface() {
+    // TODO: Implement test
+}
+
+#[test]
+fn should_perform_noise_handshake_over_udp() {
+    // TODO: Implement test
+}

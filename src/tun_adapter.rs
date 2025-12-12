@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::io::{self, ErrorKind};
 use std::net::Ipv4Addr;
 use tun::{Configuration, Device as TunDevice, Layer};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct TunAdapter {
     dev: TunDevice,
